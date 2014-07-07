@@ -12,6 +12,8 @@
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE DoAndIfThenElse    #-}
 {-# LANGUAGE OverloadedStrings  #-}
+{-# LANGUAGE RecordWildCards    #-}
+{-# LANGUAGE LambdaCase         #-}
 
 module Network.Http.Connection (
     Connection(..),
@@ -36,48 +38,50 @@ module Network.Http.Connection (
 ) where
 
 import Blaze.ByteString.Builder (Builder)
-import qualified Blaze.ByteString.Builder as Builder (flush, fromByteString,
-                                                      toByteString)
-import qualified Blaze.ByteString.Builder.HTTP as Builder (chunkedTransferEncoding, chunkedTransferTerminator)
+import qualified Blaze.ByteString.Builder as Bld ( flush, fromByteString
+                                                 , toByteString)
+import qualified Blaze.ByteString.Builder.HTTP as Bld ( chunkedTransferEncoding
+                                                    , chunkedTransferTerminator)
+import Control.Applicative ((<$>), (<*))
 import Control.Exception (bracket)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as S
-import Data.Monoid (mappend, mempty)
-import Network.Socket
+import Data.Monoid (mempty, (<>))
+import Network.Socket ( AddrInfo(..), AddrInfoFlag(..), SocketType(..)
+                      , getAddrInfo, defaultProtocol, socket, connect
+                      , defaultHints, close)
 import OpenSSL (withOpenSSL)
-import OpenSSL.Session (SSL, SSLContext)
+import OpenSSL.Session (SSLContext)
 import qualified OpenSSL.Session as SSL
 import System.IO.Streams (InputStream, OutputStream, stdout)
 import qualified System.IO.Streams as Streams
 import qualified System.IO.Streams.SSL as Streams hiding (connect)
 
-import Network.Http.Internal
-import Network.Http.ResponseParser
+import Network.Http.Internal ( Request(..), Response(..), Hostname, Port
+                             , EntityBody(..), ExpectMode(..), Headers
+                             , ContentEncoding(..), updateHeader
+                             , retrieveHeaders, getStatusCode
+                             , composeResponseBytes, composeRequestBytes)
+import Network.Http.ResponseParser ( UnexpectedCompression
+                                   , readResponseHeader, readResponseBody)
 
 --
 -- | A connection to a web server.
 --
-data Connection
-    = Connection {
-        cHost  :: ByteString,
-            -- ^ will be used as the Host: header in the HTTP request.
-        cClose :: IO (),
-            -- ^ called when the connection should be closed.
-        cOut   :: OutputStream Builder,
-        cIn    :: InputStream ByteString
-    }
+data Connection = Connection 
+  { cHost  :: ByteString -- ^ used as the Host: header in the HTTP request.
+  , cClose :: IO ()      -- ^ called when the connection should be closed.
+  , cIn    :: InputStream ByteString
+  , cOut   :: OutputStream Builder
+  }
 
 instance Show Connection where
-    show c =    {-# SCC "Connection.show" #-}
-        concat
-           ["Host: ",
-             S.unpack $ cHost c,
-             "\n"]
-
+  show c = {-# SCC "Connection.show" #-}
+    concat ["Host: ", S.unpack $ cHost c, "\n"]
 
 --
 -- | Create a raw Connection object from the given parts. This is
--- primarily of use when teseting, for example:
+-- primarily of use when testing, for example:
 --
 -- > fakeConnection :: IO Connection
 -- > fakeConnection = do
@@ -98,22 +102,20 @@ instance Show Connection where
 -- reject your message.
 --
 makeConnection
-    :: ByteString
-    -- ^ will be used as the @Host:@ header in the HTTP request.
-    -> IO ()
-    -- ^ an action to be called when the connection is terminated.
-    -> OutputStream ByteString
-    -- ^ write end of the HTTP client-server connection.
-    -> InputStream ByteString
-    -- ^ read end of the HTTP client-server connection.
-    -> IO Connection
-makeConnection h c o1 i = do
-    o2 <- Streams.builderStream o1
-    return $! Connection h c o2 i
-
+  :: ByteString
+  -- ^ will be used as the @Host:@ header in the HTTP request.
+  -> IO ()
+  -- ^ an action to be called when the connection is terminated.
+  -> OutputStream ByteString
+  -- ^ write end of the HTTP client-server connection.
+  -> InputStream ByteString
+  -- ^ read end of the HTTP client-server connection.
+  -> IO Connection
+makeConnection host action out inp = 
+  Connection host action inp <$> Streams.builderStream out
 
 --
--- | Given an @IO@ action producing a 'Connection', and a computation
+-- | Given an @IO@ action producing a @Connection@, and a computation
 -- that needs one, runs the computation, cleaning up the
 -- @Connection@ afterwards.
 --
@@ -127,12 +129,10 @@ makeConnection h c o1 i = do
 -- which can make the code making an HTTP request a lot more
 -- straight-forward.
 --
--- Wraps @Control.Exception@'s 'Control.Exception.bracket'.
+-- Wraps @bracket@ from @Control.Exception@.
 --
 withConnection :: IO Connection -> (Connection -> IO γ) -> IO γ
-withConnection mkC =
-    bracket mkC closeConnection
-
+withConnection = flip bracket closeConnection
 
 --
 -- | In order to make a request you first establish the TCP
@@ -140,7 +140,7 @@ withConnection mkC =
 --
 -- Ordinarily you would supply the host part of the URL here and it will
 -- be used as the value of the HTTP 1.1 @Host:@ field. However, you can
--- specify any server name or IP addresss and set the @Host:@ value
+-- specify any server name or IP address and set the @Host:@ value
 -- later with 'Network.Http.Client.setHostname' when building the
 -- request.
 --
@@ -163,32 +163,21 @@ withConnection mkC =
 -- connection for subsequent requests.
 --
 openConnection :: Hostname -> Port -> IO Connection
-openConnection h1' p = do
-    is <- getAddrInfo (Just hints) (Just h1) (Just $ show p)
-    let addr = head is
-    let a = addrAddress addr
-    s <- socket (addrFamily addr) Stream defaultProtocol
+openConnection host port = do
+  let hints = defaultHints {addrFlags = [AI_ADDRCONFIG, AI_NUMERICSERV]}
+  addrs <- getAddrInfo (Just hints) (Just $ S.unpack host) (Just $ show port)
+  case addrs of
+    [] -> error $ "Couldn't get address info for " <> show host
+    AddrInfo{..}:_ -> do
+      sock <- socket addrFamily Stream defaultProtocol
+      connect sock addrAddress
 
-    connect s a
-    (i,o1) <- Streams.socketToStreams s
+      -- Create the input and output socket streams from the socket
+      (i, o') <- Streams.socketToStreams sock
+      o <- Streams.builderStream o'
 
-    o2 <- Streams.builderStream o1
-
-    return Connection {
-        cHost  = h2',
-        cClose = close s,
-        cOut   = o2,
-        cIn    = i
-    }
-  where
-    hints = defaultHints {
-        addrFlags = [AI_ADDRCONFIG, AI_NUMERICSERV],
-        addrSocketType = Stream
-    }
-    h2' = if p == 80
-        then h1'
-        else S.concat [ h1', ":", S.pack $ show p ]
-    h1  = S.unpack h1'
+      let host' = if port == 80 then host else host <> ":" <> S.pack (show port)
+      return $! Connection host' (close sock) i o
 
 --
 -- | Open a secure connection to a web server.
@@ -218,42 +207,24 @@ openConnection h1' p = do
 -- by the @HsOpenSSL@ package and @openssl-streams@.
 --
 -- /There is no longer a need to call @withOpenSSL@ explicitly; the
--- initialization is invoked once per process for you/
+-- initialization is invoked once per process for you./
 --
 openConnectionSSL :: SSLContext -> Hostname -> Port -> IO Connection
-openConnectionSSL ctx h1' p = withOpenSSL $ do
-    is <- getAddrInfo Nothing (Just h1) (Just $ show p)
+openConnectionSSL ctx host port = withOpenSSL $ do
+  addrs <- getAddrInfo Nothing (Just $ S.unpack host) (Just $ show port)
+  case addrs of
+    [] -> error $ "Couldn't get address of host " <> show host
+    AddrInfo{..}:_ -> do
+      sock <- socket addrFamily Stream defaultProtocol
+      connect sock addrAddress
+      ssl <- SSL.connection ctx sock
+      SSL.connect ssl
+      (i, o') <- Streams.sslToStreams ssl
+      o <- Streams.builderStream o'
+      let h = if port == 443 then host else host <> ":" <> S.pack (show port)
+          closeSSL = SSL.shutdown ssl SSL.Unidirectional >> close sock
+      return $! Connection h closeSSL i o
 
-    let a = addrAddress $ head is
-        f = addrFamily $ head is
-    s <- socket f Stream defaultProtocol
-
-    connect s a
-
-    ssl <- SSL.connection ctx s
-    SSL.connect ssl
-
-    (i,o1) <- Streams.sslToStreams ssl
-
-    o2 <- Streams.builderStream o1
-
-    return Connection {
-        cHost  = h2',
-        cClose = closeSSL s ssl,
-        cOut   = o2,
-        cIn    = i
-    }
-  where
-    h2' :: ByteString
-    h2' = if p == 443
-        then h1'
-        else S.concat [ h1', ":", S.pack $ show p ]
-    h1  = S.unpack h1'
-
-closeSSL :: Socket -> SSL -> IO ()
-closeSSL s ssl = do
-    SSL.shutdown ssl SSL.Unidirectional
-    close s
 
 --
 -- | Having composed a 'Request' object with the headers and metadata for
@@ -277,66 +248,35 @@ closeSSL s ssl = do
     and we are of course working in OutputStream Builder by that point.
 -}
 sendRequest :: Connection -> Request -> (OutputStream Builder -> IO α) -> IO α
-sendRequest c q handler = do
-    -- write the headers
+sendRequest Connection{..} req@(Request{..}) handler = do
+  -- Write the headers.
+  Streams.write (Just $ composeRequestBytes req cHost) cOut
 
-    Streams.write (Just msg) o2
+  -- Deal with the expect-continue mess.
+  body <- case qExpect of
+    Normal -> return qBody
+    Continue -> do
+      Streams.write (Just Bld.flush) cOut
+      readResponseHeader cIn >>= \r -> case getStatusCode r of
+        -- 100 means ok to send
+        100 -> return qBody
+        -- Otherwise, put the response back
+        _   -> do 
+          Streams.unRead (Bld.toByteString $ composeResponseBytes r) cIn
+          return Empty
 
-    -- deal with the expect-continue mess
+  -- Write the body, if there is one.
+  result <- case body of
+    Empty    -> handler =<< Streams.nullOutput
+    Chunking -> do
+      res <- handler =<< Streams.contramap Bld.chunkedTransferEncoding cOut
+      Streams.write (Just Bld.chunkedTransferTerminator) cOut
+      return res
+    Static _ -> handler cOut
 
-    e2 <- case t of
-        Normal -> do
-            return e
-
-        Continue -> do
-            Streams.write (Just Builder.flush) o2
-
-            p  <- readResponseHeader i
-
-            case getStatusCode p of
-                100 -> do
-                        -- ok to send
-                        return e
-                _   -> do
-                        -- put the response back
-                        Streams.unRead (rsp p) i
-                        return Empty
-
-    -- write the body, if there is one
-
-    x <- case e2 of
-        Empty -> do
-            o3 <- Streams.nullOutput
-            y <- handler o3
-            return y
-
-        Chunking    -> do
-            o3 <- Streams.contramap Builder.chunkedTransferEncoding o2
-            y  <- handler o3
-            Streams.write (Just Builder.chunkedTransferTerminator) o2
-            return y
-
-        (Static _) -> do
---          o3 <- Streams.giveBytes (fromIntegral n :: Int64) o2
-            y  <- handler o2
-            return y
-
-
-    -- push the stream out by flushing the output buffers
-
-    Streams.write (Just Builder.flush) o2
-
-    return x
-
-  where
-    o2 = cOut c
-    e = qBody q
-    t = qExpect q
-    msg = composeRequestBytes q h'
-    h' = cHost c
-    i = cIn c
-    rsp p = Builder.toByteString $ composeResponseBytes p
-
+  -- Push the stream out by flushing the output buffers.
+  Streams.write (Just Bld.flush) cOut
+  return result
 
 --
 -- | Get the virtual hostname that will be used as the @Host:@ header in
@@ -345,19 +285,11 @@ sendRequest c q handler = do
 -- for HTTP.
 --
 getHostname :: Connection -> Request -> ByteString
-getHostname c q =
-    case qHost q of
-        Just h' -> h'
-        Nothing -> cHost c
-
+getHostname Connection{..} Request{..} = maybe cHost id qHost
 
 {-# DEPRECATED getRequestHeaders "use retrieveHeaders . getHeadersFull instead" #-}
 getRequestHeaders :: Connection -> Request -> [(ByteString, ByteString)]
-getRequestHeaders c q =
-    ("Host", getHostname c q) : kvs
-  where
-    h = qHeaders q
-    kvs = retrieveHeaders h
+getRequestHeaders c r = ("Host", getHostname c r) : retrieveHeaders (qHeaders r)
 
 --
 -- | Get the headers that will be sent with this request. You likely won't
@@ -369,23 +301,19 @@ getRequestHeaders c q =
 --
 -- > import Network.Http.Types
 --
--- then use 'Network.Http.Types.retreiveHeaders' as follows:
+-- then use @Network.Http.Types.retrieveHeaders@ as follows:
 --
--- >>> let kvs = retreiveHeaders $ getHeadersFull c q
+-- >>> let kvs = retrieveHeaders $ getHeadersFull c q
 -- >>> :t kvs
 -- :: [(ByteString, ByteString)]
 --
 getHeadersFull :: Connection -> Request -> Headers
-getHeadersFull c q =
-    h'
-  where
-    h  = qHeaders q
-    h' = updateHeader h "Host" (getHostname c q)
+getHeadersFull c req = updateHeader (qHeaders req) "Host" (getHostname c req)
 
 --
 -- | Handle the response coming back from the server. This function
 -- hands control to a handler function you supply, passing you the
--- 'Response' object with the response headers and an 'InputStream'
+-- @Response@ object with the response headers and an @InputStream@
 -- containing the entity body.
 --
 -- For example, if you just wanted to print the first chunk of the
@@ -398,13 +326,13 @@ getHeadersFull c q =
 -- >             Nothing    -> return ())
 --
 -- Obviously, you can do more sophisticated things with the
--- 'InputStream', which is the whole point of having an @io-streams@
+-- @InputStream@, which is the whole point of having an @io-streams@
 -- based HTTP client library.
 --
 -- The final value from the handler function is the return value of
 -- @receiveResponse@, if you need it.
 --
--- Throws 'UnexpectedCompression' if it doesn't know how to handle the
+-- Throws @UnexpectedCompression@ if it doesn't know how to handle the
 -- compression format used in the response.
 --
 {-
@@ -416,18 +344,12 @@ getHeadersFull c q =
     InputStream ByteString in Connection remains unconsumed beyond the
     threshold of the current response, which is exactly what we need.
 -}
-receiveResponse :: Connection -> (Response -> InputStream ByteString -> IO β) -> IO β
-receiveResponse c handler = do
-    p  <- readResponseHeader i
-    i' <- readResponseBody p i
-
-    x  <- handler p i'
-
-    Streams.skipToEof i'
-
-    return x
-  where
-    i = cIn c
+receiveResponse :: Connection 
+                -> (Response -> InputStream ByteString -> IO β) -> IO β
+receiveResponse Connection{..} handler = do
+  p  <- readResponseHeader cIn
+  inp <- readResponseBody p cIn
+  handler p inp <* Streams.skipToEof inp
 
 --
 -- | This is a specialized variant of 'receiveResponse' that /explicitly/ does
@@ -438,23 +360,12 @@ receiveResponse c handler = do
 {-
     See notes at receiveResponse.
 -}
-receiveResponseRaw :: Connection -> (Response -> InputStream ByteString -> IO β) -> IO β
-receiveResponseRaw c handler = do
-    p  <- readResponseHeader i
-    let p' = p {
-        pContentEncoding = Identity
-    }
-
-    i' <- readResponseBody p' i
-
-    x  <- handler p i'
-
-    Streams.skipToEof i'
-
-    return x
-  where
-    i = cIn c
-
+receiveResponseRaw :: Connection 
+                   -> (Response -> InputStream ByteString -> IO β) -> IO β
+receiveResponseRaw Connection{..} handler = do
+  p  <- readResponseHeader cIn
+  i' <- readResponseBody (p {pContentEncoding = Identity}) cIn
+  handler p i' <* Streams.skipToEof i'
 
 --
 -- | Use this for the common case of the HTTP methods that only send
@@ -462,7 +373,6 @@ receiveResponseRaw c handler = do
 --
 emptyBody :: OutputStream Builder -> IO ()
 emptyBody _ = return ()
-
 
 --
 -- | Specify a local file to be sent to the server as the body of the
@@ -483,9 +393,7 @@ emptyBody _ = return ()
     does]. A more efficient way to do this would be interesting.
 -}
 fileBody :: FilePath -> OutputStream Builder -> IO ()
-fileBody p o = do
-    Streams.withFileAsInput p (\i -> inputStreamBody i o)
-
+fileBody path out = Streams.withFileAsInput path $ flip inputStreamBody out
 
 --
 -- | Read from a pre-existing 'InputStream' and pipe that through to the
@@ -498,7 +406,7 @@ fileBody p o = do
 -- >     i <- getStreamFromVault                    -- magic, clearly
 -- >     sendRequest c q (inputStreamBody i)
 --
--- This function maps "Builder.fromByteString" over the input, which will
+-- This function maps "Bld.fromByteString" over the input, which will
 -- be efficient if the ByteString chunks are large.
 --
 {-
@@ -507,9 +415,8 @@ fileBody p o = do
     pipeline!
 -}
 inputStreamBody :: InputStream ByteString -> OutputStream Builder -> IO ()
-inputStreamBody i1 o = do
-    i2 <- Streams.map Builder.fromByteString i1
-    Streams.supply i2 o
+inputStreamBody inp out = 
+  Streams.map Bld.fromByteString inp >>= flip Streams.supply out
 
 
 --
@@ -541,14 +448,14 @@ inputStreamBody i1 o = do
 -- or thereabouts.
 --
 debugHandler :: Response -> InputStream ByteString -> IO ()
-debugHandler p i = do
-    S.putStr $ S.filter (/= '\r') $ Builder.toByteString $ composeResponseBytes p
-    Streams.connect i stdout
-
+debugHandler resp inp = do
+  let prepare = S.filter (/= '\r') . Bld.toByteString . composeResponseBytes
+  S.putStr $ prepare resp
+  Streams.connect inp stdout
 
 --
 -- | Sometimes you just want the entire response body as a single blob.
--- This function concatonates all the bytes from the response into a
+-- This function concatenates all the bytes from the response into a
 -- ByteString. If using the main @http-streams@ API, you would use it
 -- as follows:
 --
@@ -563,10 +470,9 @@ debugHandler p i = do
 --
 -- >    x' <- get "http://www.example.com/document.txt" concatHandler
 --
--- Either way, the usual caveats about allocating a
--- single object from streaming I/O apply: do not use this if you are
--- not absolutely certain that the response body will fit in a
--- reasonable amount of memory.
+-- Either way, the usual caveats about allocating a single object from 
+-- streaming I/O apply: do not use this if you are not absolutely certain that
+-- the response body will fit in a reasonable amount of memory.
 --
 -- Note that this function makes no discrimination based on the
 -- response's HTTP status code. You're almost certainly better off
@@ -576,17 +482,16 @@ debugHandler p i = do
     I'd welcome a better name for this function.
 -}
 concatHandler :: Response -> InputStream ByteString -> IO ByteString
-concatHandler _ i1 = do
-    i2 <- Streams.map Builder.fromByteString i1
-    x <- Streams.fold mappend mempty i2
-    return $ Builder.toByteString x
-
+concatHandler _ inp = do
+  inp' <- Streams.map Bld.fromByteString inp
+  Bld.toByteString <$> Streams.fold (<>) mempty inp'
 
 --
 -- | Shutdown the connection. You need to call this release the
 -- underlying socket file descriptor and related network resources. To
--- do so reliably, use this in conjunction with 'openConnection' in a
--- call to 'Control.Exception.bracket':
+-- do so reliably, use this in conjunction with @openConnection@ in a
+-- call to @Control.Exception.bracket@. Or just use
+-- @withConnection@ does):
 --
 -- > --
 -- > -- Make connection, cleaning up afterward
@@ -604,7 +509,7 @@ concatHandler _ i1 = do
 -- >
 -- > doStuff :: Connection -> IO ByteString
 --
--- or, just use 'withConnection'.
+-- or, just use @withConnection@.
 --
 -- While returning a ByteString is probably the most common use case,
 -- you could conceivably do more processing of the response in 'doStuff'

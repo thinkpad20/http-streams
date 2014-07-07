@@ -11,3 +11,5 @@ TAGS
 config.h
 tests/benchmark.hs
 tests/snippet.hs
+.cabal-sandbox
+cabal.sandbox.config
